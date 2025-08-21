@@ -111,8 +111,6 @@ public:
             SWSS_LOG_WARN("Failed to open log file %s", m_logPath.c_str());
         }
         m_seenRotateGen = g_rotateGen.load();
-        std::cout << "[DBG] DBRecorder ctor db=" << m_dbId << ", sep='" << m_sep
-                  << "' log_path=" << m_logPath << " open=" << std::boolalpha << m_log.is_open() << std::endl;
     }
 
     ~DBRecorder() {
@@ -125,7 +123,6 @@ public:
         m_pubsub->psubscribe(pattern);
         m_thr.reset(new std::thread(&DBRecorder::run, this));
         SWSS_LOG_INFO("Recorder started for db %d", m_dbId);
-        std::cout << "[DBG] start() subscribed pattern='" << pattern << "' for db=" << m_dbId << std::endl;
     }
 
     void stop() {
@@ -135,16 +132,13 @@ public:
                 // best-effort unsubscribe: pattern must match what we subscribed
                 const std::string pattern = "__keyspace@" + std::to_string(m_dbId) + "__:*";
                 m_pubsub->punsubscribe(pattern);
-                std::cout << "[DBG] stop() unsubscribed pattern='" << pattern << "' for db=" << m_dbId << std::endl;
             }
         } catch (...) {}
         if (m_thr && m_thr->joinable()) {
-            std::cout << "[DBG] stop() joining worker thread for db=" << m_dbId << std::endl;
             m_thr->join();
         }
         if (m_log.is_open()) m_log.flush();
         SWSS_LOG_INFO("Recorder stopped for db %d", m_dbId);
-        std::cout << "[DBG] stop() completed for db=" << m_dbId << std::endl;
     }
 
 private:
@@ -167,22 +161,15 @@ private:
 
             if (ch.empty() || op.empty()) continue;
 
-            std::cout << "[DBG] run() raw msg: type=" << itType->second
-                      << " channel='" << ch << "' op='" << op << "'" << std::endl;
-
             std::string table, keys;
             if (!parseChannel(ch, m_sep, table, keys)) continue;
 
-            std::cout << "[DBG] run() parsed: table='" << table << "' key='" << keys << "'" << std::endl;
 
             if (op == "del") {
-                std::cout << "[DBG] run() dispatch: DEL" << std::endl;
                 log_del(table, keys);
             } else if (op == "hset") {
-                std::cout << "[DBG] run() dispatch: HSET" << std::endl;
                 log_hset(table, keys);
             } else if (op == "hdel") {
-                std::cout << "[DBG] run() dispatch: HDEL" << std::endl;
                 log_hdel(table, keys);
             }
         }
@@ -207,26 +194,22 @@ private:
 
     void log_hset(const std::string& table, const std::string& key) {
         const std::string redisKey = table + m_sep + key;
-        std::cout << "[DBG] log_hset redisKey='" << redisKey << "'" << std::endl;
         auto h = m_conn->hgetall<std::unordered_map<std::string, std::string>>(redisKey);
         std::string log = table + "|" + key;
         for (const auto& kv : h) {
             log += "|" + kv.first + ":" + kv.second;
         }
         write_line("HSET", log);
-        std::cout << "[DBG] log_hset wrote line (fields=" << h.size() << ")" << std::endl;
     }
 
     void log_del(const std::string& table, const std::string& key) {
         std::string log = table + "|" + key;
         write_line("DELETED", log);
         SWSS_LOG_INFO("REDIS_RECORDER: %s deleted from table %s in DB %d", key.c_str(), table.c_str(), m_dbId);
-        std::cout << "[DBG] log_del wrote line for key='" << key << "'" << std::endl;
     }
 
     void log_hdel(const std::string& table, const std::string& key) {
         const std::string full_key = table.empty() ? key : (table + m_sep + key);
-        std::cout << "[DBG] log_hdel full_key='" << full_key << "'" << std::endl;
         auto h = m_conn->hgetall<std::unordered_map<std::string, std::string>>(full_key);
         if (!h.empty()) {
             std::string log = full_key;
@@ -234,10 +217,8 @@ private:
                 log += "|" + kv.first + ":" + kv.second;
             }
             write_line("HDEL", log);
-            std::cout << "[DBG] log_hdel wrote line (fields=" << h.size() << ")" << std::endl;
         } else {
             write_line("HDEL", full_key + "|EMPTY");
-            std::cout << "[DBG] log_hdel wrote line (EMPTY)" << std::endl;
         }
     }
 
@@ -260,9 +241,8 @@ private:
             m_log.flush();
         } else {
             // fallback
-            std::cout << line;
+            SWSS_LOG_INFO("%s", line.c_str());
         }
-        std::cout << "[DBG] write_line tag='" << tag << "' body_len=" << body.size() << std::endl;
     }
 
 private:
@@ -281,17 +261,14 @@ std::unordered_map<std::string, bool> read_initial_config()
 {
     std::unordered_map<std::string, bool> result;
     try {
-        std::cout << "[DBG] read_initial_config open '/etc/sonic/config_db.json'" << std::endl;
         std::ifstream f("/etc/sonic/config_db.json");
         if (!f.is_open()) {
             SWSS_LOG_ERROR("Failed to open /etc/sonic/config_db.json");
-            std::cout << "[DBG] read_initial_config failed to open file" << std::endl;
             return result;
         }
         nlohmann::json j;
         f >> j;
         if (!j.contains("RECORDER") || !j["RECORDER"].is_object()) {
-            std::cout << "[DBG] read_initial_config no RECORDER object found" << std::endl;
             return result;
         }
 
@@ -308,11 +285,9 @@ std::unordered_map<std::string, bool> read_initial_config()
                 }
             }
             result[name] = enabled;
-            std::cout << "[DBG] read_initial_config recorder name='" << name << "' enabled=" << std::boolalpha << enabled << std::endl;
         }
     } catch (const std::exception& e) {
         SWSS_LOG_ERROR("read_initial_config exception: %s", e.what());
-        std::cout << "[DBG] read_initial_config exception: " << e.what() << std::endl;
     }
     return result;
 }
@@ -345,14 +320,12 @@ int main()
     ensureRecordDir();
 
     SWSS_LOG_INFO("Starting sonic-db-rec (C++14)");
-    std::cout << "[DBG] main() start" << std::endl;
 
     std::unordered_map<std::string, std::unique_ptr<DBRecorder>> recorders;
     std::mutex mtx;
 
     // Initial config
     auto init = read_initial_config();
-    std::cout << "[DBG] main() initial config entries=" << init.size() << std::endl;
     for (const auto& kv : init) {
         auto it = DB_MAP.find(kv.first);
         if (kv.second && it != DB_MAP.end()) {
@@ -360,7 +333,6 @@ int main()
             rec->start();
             recorders.emplace(kv.first, std::move(rec));
             SWSS_LOG_NOTICE("started recorder for %s (db %d)", kv.first.c_str(), it->second);
-            std::cout << "[DBG] main() started recorder name='" << kv.first << "' db=" << it->second << std::endl;
         }
     }
 
@@ -372,7 +344,6 @@ int main()
     }
     std::unique_ptr<PubSub> cps(new PubSub(conf.get()));
     cps->psubscribe("__keyspace@4__:RECORDER*");
-    std::cout << "[DBG] main() control psubscribe '__keyspace@4__:RECORDER*'" << std::endl;
 
     while (!g_stop) {
         std::map<std::string, std::string> msg;
@@ -391,7 +362,6 @@ int main()
         const std::string op = msg.count("data") ? msg.at("data") : "";
         if (ch.empty() || op.empty()) continue;
 
-        std::cout << "[DBG] main() control msg ch='" << ch << "' op='" << op << "'" << std::endl;
 
         if (op != "hset" && op != "hdel" && op != "del") continue;
 
@@ -402,7 +372,6 @@ int main()
         if (key.find("RECORDER|") != 0) continue;
         std::string name = key.substr(std::string("RECORDER|").size());
 
-        std::cout << "[DBG] main() control name='" << name << "'" << std::endl;
 
         auto it = DB_MAP.find(name);
         if (it == DB_MAP.end()) continue;
@@ -418,22 +387,18 @@ int main()
         }
         bool want_enabled = (state == "enabled");
 
-        std::cout << "[DBG] main() control state='" << state << "' want_enabled=" << std::boolalpha << want_enabled << std::endl;
 
         std::lock_guard<std::mutex> lk(mtx);
         bool have = (recorders.find(name) != recorders.end());
-        std::cout << "[DBG] main() control have_recorder=" << std::boolalpha << have << std::endl;
         if (want_enabled && !have) {
             auto rec = std::unique_ptr<DBRecorder>(new DBRecorder(it->second));
             rec->start();
             recorders.emplace(name, std::move(rec));
             SWSS_LOG_NOTICE("enabled recorder for %s (db %d)", name.c_str(), it->second);
-            std::cout << "[DBG] main() enabled recorder name='" << name << "' db=" << it->second << std::endl;
         } else if (!want_enabled && have) {
             recorders[name]->stop();
             recorders.erase(name);
             SWSS_LOG_NOTICE("disabled recorder for %s", name.c_str());
-            std::cout << "[DBG] main() disabled recorder name='" << name << std::endl;
         }
     }
 
@@ -448,6 +413,5 @@ int main()
     }
 
     SWSS_LOG_INFO("Exiting sonic-db-rec (C++14)");
-    std::cout << "[DBG] main() exit" << std::endl;
     return 0;
 }
