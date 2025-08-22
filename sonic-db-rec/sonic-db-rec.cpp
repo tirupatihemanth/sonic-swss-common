@@ -21,25 +21,24 @@
 #include "common/pubsub.h"
 #include "common/logger.h"
 #include <nlohmann/json.hpp>
+#include "sonic-db-rec.h"
 
 using namespace std::chrono_literals;
 using swss::DBConnector;
 using swss::PubSub;
 
-namespace {
-
-static const std::unordered_map<std::string, int> DB_MAP = {
+const std::unordered_map<std::string, int> DB_MAP = {
     {"config_db", 4},
     {"state_db", 6},
 };
 
-static const std::unordered_map<int, std::string> LOG_NAME = {
+const std::unordered_map<int, std::string> LOG_NAME = {
     {4, "config"},
     {6, "state"},
 };
 
-static std::atomic<bool> g_stop{false};
-static std::atomic<unsigned int> g_rotateGen{0};
+std::atomic<bool> g_stop{false};
+std::atomic<unsigned int> g_rotateGen{0};
 
 std::string ts()
 {
@@ -58,7 +57,7 @@ std::string ts()
     return std::string(buf);
 }
 
-static void ensureRecordDir()
+void ensureRecordDir()
 {
     const char* dir = "/var/log/record";
     struct stat st;
@@ -76,7 +75,7 @@ static void ensureRecordDir()
     }
 }
 
-static std::unique_ptr<DBConnector> makeDbConnectorWithRetry(int dbId, const std::string &host, int port, unsigned int timeout_ms)
+std::unique_ptr<DBConnector> makeDbConnectorWithRetry(int dbId, const std::string &host, int port, unsigned int timeout_ms)
 {
     using namespace std::chrono_literals;
     while (!g_stop.load()) {
@@ -91,186 +90,173 @@ static std::unique_ptr<DBConnector> makeDbConnectorWithRetry(int dbId, const std
     return nullptr;
 }
 
-class DBRecorder {
-public:
-    explicit DBRecorder(int db)
+// DBRecorder method implementations
+
+DBRecorder::DBRecorder(int db)
     : m_dbId(db),
       m_sep((db == 4 || db == 6) ? '|' : ':'),
       m_conn(makeDbConnectorWithRetry(db, "127.0.0.1", 6379, 0)),
       m_pubsub(m_conn ? new PubSub(m_conn.get()) : nullptr)
-    {
-        if (!m_conn) {
-            throw std::runtime_error("DBRecorder constructed without Redis connection");
+{
+    if (!m_conn) {
+        throw std::runtime_error("DBRecorder constructed without Redis connection");
+    }
+    auto it = LOG_NAME.find(db);
+    const std::string name = (it != LOG_NAME.end()) ? it->second : std::to_string(db);
+    const std::string path = "/var/log/record/" + name + ".rec";
+    m_logPath = path;
+    m_log.open(m_logPath, std::ios::out | std::ios::app);
+    if (!m_log.is_open()) {
+        SWSS_LOG_WARN("Failed to open log file %s", m_logPath.c_str());
+    }
+    m_seenRotateGen = g_rotateGen.load();
+}
+
+DBRecorder::~DBRecorder() {
+    stop();
+}
+
+void DBRecorder::start() {
+    if (m_running.exchange(true)) return;
+    const std::string pattern = "__keyspace@" + std::to_string(m_dbId) + "__:*";
+    m_pubsub->psubscribe(pattern);
+    m_thr.reset(new std::thread(&DBRecorder::run, this));
+    SWSS_LOG_INFO("Recorder started for db %d", m_dbId);
+}
+
+void DBRecorder::stop() {
+    if (!m_running.exchange(false)) return;
+    try {
+        if (m_pubsub) {
+            // best-effort unsubscribe: pattern must match what we subscribed
+            const std::string pattern = "__keyspace@" + std::to_string(m_dbId) + "__:*";
+            m_pubsub->punsubscribe(pattern);
         }
-        auto it = LOG_NAME.find(db);
-        const std::string name = (it != LOG_NAME.end()) ? it->second : std::to_string(db);
-        const std::string path = "/var/log/record/" + name + ".rec";
-        m_logPath = path;
-        m_log.open(m_logPath, std::ios::out | std::ios::app);
-        if (!m_log.is_open()) {
-            SWSS_LOG_WARN("Failed to open log file %s", m_logPath.c_str());
-        }
-        m_seenRotateGen = g_rotateGen.load();
+    } catch (...) {}
+    if (m_thr && m_thr->joinable()) {
+        m_thr->join();
     }
+    if (m_log.is_open()) m_log.flush();
+    SWSS_LOG_INFO("Recorder stopped for db %d", m_dbId);
+}
 
-    ~DBRecorder() {
-        stop();
-    }
-
-    void start() {
-        if (m_running.exchange(true)) return;
-        const std::string pattern = "__keyspace@" + std::to_string(m_dbId) + "__:*";
-        m_pubsub->psubscribe(pattern);
-        m_thr.reset(new std::thread(&DBRecorder::run, this));
-        SWSS_LOG_INFO("Recorder started for db %d", m_dbId);
-    }
-
-    void stop() {
-        if (!m_running.exchange(false)) return;
+void DBRecorder::run() {
+    while (m_running && !g_stop) {
+        std::map<std::string, std::string> msg;
         try {
-            if (m_pubsub) {
-                // best-effort unsubscribe: pattern must match what we subscribed
-                const std::string pattern = "__keyspace@" + std::to_string(m_dbId) + "__:*";
-                m_pubsub->punsubscribe(pattern);
-            }
-        } catch (...) {}
-        if (m_thr && m_thr->joinable()) {
-            m_thr->join();
+            msg = m_pubsub->get_message(0.5 /*sec*/, true);
+        } catch (...) {
+            std::this_thread::sleep_for(500ms);
+            continue;
         }
-        if (m_log.is_open()) m_log.flush();
-        SWSS_LOG_INFO("Recorder stopped for db %d", m_dbId);
-    }
+        if (msg.empty()) continue;
 
-private:
-    void run() {
-        while (m_running && !g_stop) {
-            std::map<std::string, std::string> msg;
-            try {
-                msg = m_pubsub->get_message(0.5 /*sec*/, true);
-            } catch (...) {
-                std::this_thread::sleep_for(500ms);
-                continue;
-            }
-            if (msg.empty()) continue;
+        const auto itType = msg.find("type");
+        if (itType == msg.end() || (itType->second != "pmessage" && itType->second != "message")) continue;
 
-            const auto itType = msg.find("type");
-            if (itType == msg.end() || (itType->second != "pmessage" && itType->second != "message")) continue;
+        const std::string ch   = getOrEmpty(msg, "channel");
+        const std::string op   = getOrEmpty(msg, "data");
 
-            const std::string ch   = getOrEmpty(msg, "channel");
-            const std::string op   = getOrEmpty(msg, "data");
+        if (ch.empty() || op.empty()) continue;
 
-            if (ch.empty() || op.empty()) continue;
-
-            std::string table, keys;
-            if (!parseChannel(ch, m_sep, table, keys)) continue;
+        std::string table, keys;
+        if (!parseChannel(ch, m_sep, table, keys)) continue;
 
 
-            if (op == "del") {
-                log_del(table, keys);
-            } else if (op == "hset") {
-                log_hset(table, keys);
-            } else if (op == "hdel") {
-                log_hdel(table, keys);
-            } else {
-                // Fallback: log unhandled operation
-                SWSS_LOG_INFO("Unhandled op %s table %s key %s (db %d)", op.c_str(), table.c_str(), keys.c_str(), m_dbId);
-            }
+        if (op == "del") {
+            log_del(table, keys);
+        } else if (op == "hset") {
+            log_hset(table, keys);
+        } else if (op == "hdel") {
+            log_hdel(table, keys);
+        } else {
+            // Fallback: log unhandled operation
+            SWSS_LOG_INFO("Unhandled op %s table %s key %s (db %d)", op.c_str(), table.c_str(), keys.c_str(), m_dbId);
         }
     }
+}
 
-    static std::string getOrEmpty(const std::map<std::string, std::string>& m, const char* k) {
-        auto it = m.find(k);
-        return it == m.end() ? std::string() : it->second;
+std::string DBRecorder::getOrEmpty(const std::map<std::string, std::string>& m, const char* k) {
+    auto it = m.find(k);
+    return it == m.end() ? std::string() : it->second;
+}
+
+bool DBRecorder::parseChannel(const std::string& ch, char sep, std::string& table, std::string& keys) {
+    // "__keyspace@<db>__:<table><sep><keys>"
+    auto posColon = ch.find(':');
+    if (posColon == std::string::npos) return false;
+    auto posSep = ch.find(sep, posColon + 1);
+    if (posSep == std::string::npos || posSep <= posColon + 1) return false;
+
+    table = ch.substr(posColon + 1, posSep - (posColon + 1));
+    keys  = ch.substr(posSep + 1);
+    return true;
+}
+
+void DBRecorder::log_hset(const std::string& table, const std::string& key) {
+    const std::string redisKey = table + m_sep + key;
+    auto h = m_conn->hgetall<std::unordered_map<std::string, std::string>>(redisKey);
+    const std::string tableKey = table + ":" + key;
+    std::string fields;
+    for (const auto& kv : h) {
+        if (!fields.empty()) fields += "|";
+        fields += kv.first + ":" + kv.second;
     }
+    write_line(tableKey, "SET", fields);
+}
 
-    static bool parseChannel(const std::string& ch, char sep, std::string& table, std::string& keys) {
-        // "__keyspace@<db>__:<table><sep><keys>"
-        auto posColon = ch.find(':');
-        if (posColon == std::string::npos) return false;
-        auto posSep = ch.find(sep, posColon + 1);
-        if (posSep == std::string::npos || posSep <= posColon + 1) return false;
+void DBRecorder::log_del(const std::string& table, const std::string& key) {
+    const std::string tableKey = table + ":" + key;
+    write_line(tableKey, "DEL", "");
+}
 
-        table = ch.substr(posColon + 1, posSep - (posColon + 1));
-        keys  = ch.substr(posSep + 1);
-        return true;
-    }
-
-    void log_hset(const std::string& table, const std::string& key) {
-        const std::string redisKey = table + m_sep + key;
-        auto h = m_conn->hgetall<std::unordered_map<std::string, std::string>>(redisKey);
-        const std::string tableKey = table + ":" + key;
+void DBRecorder::log_hdel(const std::string& table, const std::string& key) {
+    const std::string full_key = table.empty() ? key : (table + m_sep + key);
+    auto h = m_conn->hgetall<std::unordered_map<std::string, std::string>>(full_key);
+    const std::string tableKey = table + ":" + key;
+    if (!h.empty()) {
         std::string fields;
         for (const auto& kv : h) {
             if (!fields.empty()) fields += "|";
             fields += kv.first + ":" + kv.second;
         }
-        write_line(tableKey, "SET", fields);
+        write_line(tableKey, "HDEL", fields);
+    } else {
+        write_line(tableKey, "HDEL", "");
     }
+}
 
-    void log_del(const std::string& table, const std::string& key) {
-        const std::string tableKey = table + ":" + key;
-        write_line(tableKey, "DEL", "");
-    }
-
-    void log_hdel(const std::string& table, const std::string& key) {
-        const std::string full_key = table.empty() ? key : (table + m_sep + key);
-        auto h = m_conn->hgetall<std::unordered_map<std::string, std::string>>(full_key);
-        const std::string tableKey = table + ":" + key;
-        if (!h.empty()) {
-            std::string fields;
-            for (const auto& kv : h) {
-                if (!fields.empty()) fields += "|";
-                fields += kv.first + ":" + kv.second;
-            }
-            write_line(tableKey, "HDEL", fields);
+void DBRecorder::write_line(const std::string& tableKey, const char* tag, const std::string& fields) {
+    // Handle logrotate: reopen file if SIGHUP occurred
+    unsigned int gen = g_rotateGen.load();
+    if (gen != m_seenRotateGen) {
+        if (m_log.is_open()) m_log.close();
+        m_log.open(m_logPath, std::ofstream::out | std::ofstream::app);
+        if (!m_log.is_open()) {
+            SWSS_LOG_ERROR("Failed to reopen log file %s after SIGHUP", m_logPath.c_str());
         } else {
-            write_line(tableKey, "HDEL", "");
+            SWSS_LOG_INFO("Reopened log file %s after SIGHUP", m_logPath.c_str());
         }
+        m_seenRotateGen = gen;
     }
-
-    void write_line(const std::string& tableKey, const char* tag, const std::string& fields) {
-        // Handle logrotate: reopen file if SIGHUP occurred
-        unsigned int gen = g_rotateGen.load();
-        if (gen != m_seenRotateGen) {
-            if (m_log.is_open()) m_log.close();
-            m_log.open(m_logPath, std::ofstream::out | std::ofstream::app);
-            if (!m_log.is_open()) {
-                SWSS_LOG_ERROR("Failed to reopen log file %s after SIGHUP", m_logPath.c_str());
-            } else {
-                SWSS_LOG_INFO("Reopened log file %s after SIGHUP", m_logPath.c_str());
-            }
-            m_seenRotateGen = gen;
-        }
-        std::string line = ts();
+    std::string line = ts();
+    line += "|";
+    line += tableKey;
+    line += "|";
+    line += tag;
+    if (!fields.empty()) {
         line += "|";
-        line += tableKey;
-        line += "|";
-        line += tag;
-        if (!fields.empty()) {
-            line += "|";
-            line += fields;
-        }
-        line += "\n";
-        if (m_log.is_open()) {
-            m_log << line;
-            m_log.flush();
-        } else {
-            // fallback
-            SWSS_LOG_INFO("%s", line.c_str());
-        }
+        line += fields;
     }
-
-private:
-    int m_dbId;
-    char m_sep;
-    std::unique_ptr<DBConnector> m_conn;
-    std::unique_ptr<PubSub> m_pubsub;
-    std::unique_ptr<std::thread> m_thr;
-    std::atomic<bool> m_running{false};
-    std::ofstream m_log;
-    std::string m_logPath;
-    unsigned int m_seenRotateGen{0};
-};
+    line += "\n";
+    if (m_log.is_open()) {
+        m_log << line;
+        m_log.flush();
+    } else {
+        // fallback
+        SWSS_LOG_INFO("%s", line.c_str());
+    }
+}
 
 std::unordered_map<std::string, bool> read_initial_config()
 {
@@ -307,10 +293,8 @@ std::unordered_map<std::string, bool> read_initial_config()
     return result;
 }
 
-} // namespace
-
-static void handle_signal(int) { g_stop = true; }
-static void handle_sighup(int) { g_rotateGen.fetch_add(1, std::memory_order_relaxed); }
+void handle_signal(int) { g_stop = true; }
+void handle_sighup(int) { g_rotateGen.fetch_add(1, std::memory_order_relaxed); }
 
 int main()
 {
