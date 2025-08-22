@@ -171,6 +171,9 @@ private:
                 log_hset(table, keys);
             } else if (op == "hdel") {
                 log_hdel(table, keys);
+            } else {
+                // Fallback: log unhandled operation
+                SWSS_LOG_INFO("Unhandled op %s table %s key %s (db %d)", op.c_str(), table.c_str(), keys.c_str(), m_dbId);
             }
         }
     }
@@ -195,34 +198,37 @@ private:
     void log_hset(const std::string& table, const std::string& key) {
         const std::string redisKey = table + m_sep + key;
         auto h = m_conn->hgetall<std::unordered_map<std::string, std::string>>(redisKey);
-        std::string log = table + "|" + key;
+        const std::string tableKey = table + ":" + key;
+        std::string fields;
         for (const auto& kv : h) {
-            log += "|" + kv.first + ":" + kv.second;
+            if (!fields.empty()) fields += "|";
+            fields += kv.first + ":" + kv.second;
         }
-        write_line("HSET", log);
+        write_line(tableKey, "SET", fields);
     }
 
     void log_del(const std::string& table, const std::string& key) {
-        std::string log = table + "|" + key;
-        write_line("DELETED", log);
-        SWSS_LOG_INFO("REDIS_RECORDER: %s deleted from table %s in DB %d", key.c_str(), table.c_str(), m_dbId);
+        const std::string tableKey = table + ":" + key;
+        write_line(tableKey, "DEL", "");
     }
 
     void log_hdel(const std::string& table, const std::string& key) {
         const std::string full_key = table.empty() ? key : (table + m_sep + key);
         auto h = m_conn->hgetall<std::unordered_map<std::string, std::string>>(full_key);
+        const std::string tableKey = table + ":" + key;
         if (!h.empty()) {
-            std::string log = full_key;
+            std::string fields;
             for (const auto& kv : h) {
-                log += "|" + kv.first + ":" + kv.second;
+                if (!fields.empty()) fields += "|";
+                fields += kv.first + ":" + kv.second;
             }
-            write_line("HDEL", log);
+            write_line(tableKey, "HDEL", fields);
         } else {
-            write_line("HDEL", full_key + "|EMPTY");
+            write_line(tableKey, "HDEL", "");
         }
     }
 
-    void write_line(const char* tag, const std::string& body) {
+    void write_line(const std::string& tableKey, const char* tag, const std::string& fields) {
         // Handle logrotate: reopen file if SIGHUP occurred
         unsigned int gen = g_rotateGen.load();
         if (gen != m_seenRotateGen) {
@@ -235,7 +241,16 @@ private:
             }
             m_seenRotateGen = gen;
         }
-        const std::string line = ts() + std::string("|") + tag + "|" + body + "\n";
+        std::string line = ts();
+        line += "|";
+        line += tableKey;
+        line += "|";
+        line += tag;
+        if (!fields.empty()) {
+            line += "|";
+            line += fields;
+        }
+        line += "\n";
         if (m_log.is_open()) {
             m_log << line;
             m_log.flush();
