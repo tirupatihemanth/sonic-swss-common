@@ -18,9 +18,9 @@
 using swss::DBConnector;
 using swss::PubSub;
 
-// Constants for testing
-extern const std::unordered_map<std::string, int> DB_MAP;
-extern const std::unordered_map<int, std::string> LOG_NAME;
+// Helper functions for database operations
+int getDbIdFromName(const std::string& dbName);
+std::string getDbSeparator(const std::string& dbName);
 
 // Global state for signal handling
 extern std::atomic<bool> g_stop;
@@ -29,12 +29,12 @@ extern std::atomic<unsigned int> g_rotateGen;
 // Utility functions
 std::string ts();
 void ensureRecordDir();
-std::unique_ptr<DBConnector> makeDbConnectorWithRetry(int dbId, const std::string &host, int port, unsigned int timeout_ms);
+std::unique_ptr<DBConnector> makeDbConnectorWithRetry(const std::string& dbName, unsigned int timeout_ms);
 std::unordered_map<std::string, bool> read_initial_config();
 
 class DBRecorder {
 public:
-    explicit DBRecorder(int db);
+    explicit DBRecorder(const std::string& dbName);
     ~DBRecorder();
 
     void start();
@@ -58,6 +58,7 @@ private:
     void write_line(const std::string& tableKey, const char* tag, const std::string& fields);
 
     int m_dbId;
+    std::string m_dbName;
     char m_sep;
     std::unique_ptr<DBConnector> m_conn;
     std::unique_ptr<PubSub> m_pubsub;

@@ -26,19 +26,29 @@
 using namespace std::chrono_literals;
 using swss::DBConnector;
 using swss::PubSub;
-
-const std::unordered_map<std::string, int> DB_MAP = {
-    {"config_db", 4},
-    {"state_db", 6},
-};
-
-const std::unordered_map<int, std::string> LOG_NAME = {
-    {4, "config"},
-    {6, "state"},
-};
+using swss::SonicDBConfig;
 
 std::atomic<bool> g_stop{false};
 std::atomic<unsigned int> g_rotateGen{0};
+
+// Helper functions for database name or id
+int getDbIdFromName(const std::string& dbName) {
+    try {
+        return SonicDBConfig::getDbId(dbName);
+    } catch (const std::exception& e) {
+        SWSS_LOG_ERROR("Failed to get DB ID for database %s: %s", dbName.c_str(), e.what());
+        return -1;
+    }
+}
+
+std::string getDbSeparator(const std::string& dbName) {
+    try {
+        return SonicDBConfig::getSeparator(dbName);
+    } catch (const std::exception& e) {
+        SWSS_LOG_ERROR("Failed to get separator for database %s: %s", dbName.c_str(), e.what());
+        return ":";  // default separator
+    }
+}
 
 std::string ts()
 {
@@ -75,15 +85,15 @@ void ensureRecordDir()
     }
 }
 
-std::unique_ptr<DBConnector> makeDbConnectorWithRetry(int dbId, const std::string &host, int port, unsigned int timeout_ms)
+std::unique_ptr<DBConnector> makeDbConnectorWithRetry(const std::string& dbName, unsigned int timeout_ms)
 {
     using namespace std::chrono_literals;
     while (!g_stop.load()) {
         try {
-            std::unique_ptr<DBConnector> conn(new DBConnector(dbId, host, port, timeout_ms));
+            std::unique_ptr<DBConnector> conn(new DBConnector(dbName, timeout_ms, false));
             return conn;
         } catch (const std::exception &e) {
-            SWSS_LOG_WARN("Waiting for Redis db %d at %s:%d: %s", dbId, host.c_str(), port, e.what());
+            SWSS_LOG_WARN("Waiting for Redis db %s: %s", dbName.c_str(), e.what());
             std::this_thread::sleep_for(500ms);
         }
     }
@@ -92,18 +102,20 @@ std::unique_ptr<DBConnector> makeDbConnectorWithRetry(int dbId, const std::strin
 
 // DBRecorder method implementations
 
-DBRecorder::DBRecorder(int db)
-    : m_dbId(db),
-      m_sep((db == 4 || db == 6) ? '|' : ':'),
-      m_conn(makeDbConnectorWithRetry(db, "127.0.0.1", 6379, 0)),
+DBRecorder::DBRecorder(const std::string& dbName)
+    : m_dbId(getDbIdFromName(dbName)),
+      m_dbName(dbName),
+      m_sep(getDbSeparator(dbName)[0]),  // Take first character of separator string
+      m_conn(makeDbConnectorWithRetry(dbName, 0)),
       m_pubsub(m_conn ? new PubSub(m_conn.get()) : nullptr)
 {
+    if (m_dbId < 0) {
+        throw std::runtime_error("Invalid database name: " + dbName);
+    }
     if (!m_conn) {
         throw std::runtime_error("DBRecorder constructed without Redis connection");
     }
-    auto it = LOG_NAME.find(db);
-    const std::string name = (it != LOG_NAME.end()) ? it->second : std::to_string(db);
-    const std::string path = "/var/log/record/" + name + ".rec";
+    const std::string path = "/var/log/record/" + dbName + ".rec";
     m_logPath = path;
     m_log.open(m_logPath, std::ios::out | std::ios::app);
     if (!m_log.is_open()) {
@@ -318,6 +330,15 @@ int main()
 
     ensureRecordDir();
 
+    // Initialize SonicDBConfig to read database configuration
+    try {
+        SonicDBConfig::initialize();
+        SWSS_LOG_INFO("SonicDBConfig initialized successfully");
+    } catch (const std::exception& e) {
+        SWSS_LOG_ERROR("Failed to initialize SonicDBConfig: %s", e.what());
+        exit(1);
+    }
+
     SWSS_LOG_INFO("Starting sonic-db-rec (C++14)");
 
     std::unordered_map<std::string, std::unique_ptr<DBRecorder>> recorders;
@@ -326,23 +347,25 @@ int main()
     // Initial config
     auto init = read_initial_config();
     for (const auto& kv : init) {
-        auto it = DB_MAP.find(kv.first);
-        if (kv.second && it != DB_MAP.end()) {
-            auto rec = std::unique_ptr<DBRecorder>(new DBRecorder(it->second));
+        int dbId = getDbIdFromName(kv.first);
+        if (kv.second && dbId >= 0) {
+            auto rec = std::unique_ptr<DBRecorder>(new DBRecorder(kv.first));
             rec->start();
             recorders.emplace(kv.first, std::move(rec));
-            SWSS_LOG_NOTICE("started recorder for %s (db %d)", kv.first.c_str(), it->second);
+            SWSS_LOG_NOTICE("started recorder for %s (db %d)", kv.first.c_str(), dbId);
         }
     }
 
-    // Control loop on CONFIG_DB: "__keyspace@4__:RECORDER*"
-    std::unique_ptr<DBConnector> conf = makeDbConnectorWithRetry(4, "127.0.0.1", 6379, 0);
+    // Control loop on CONFIG_DB: "__keyspace@<config_db_id>__:RECORDER*"
+    std::unique_ptr<DBConnector> conf = makeDbConnectorWithRetry("CONFIG_DB", 0);
     if (!conf) {
         SWSS_LOG_ERROR("Exiting: could not connect to CONFIG_DB");
         return 1;
     }
+    int configDbId = getDbIdFromName("CONFIG_DB");
+    std::string configKeyspacePattern = "__keyspace@" + std::to_string(configDbId) + "__:RECORDER*";
     std::unique_ptr<PubSub> cps(new PubSub(conf.get()));
-    cps->psubscribe("__keyspace@4__:RECORDER*");
+    cps->psubscribe(configKeyspacePattern);
 
     while (!g_stop) {
         std::map<std::string, std::string> msg;
@@ -372,8 +395,8 @@ int main()
         std::string name = key.substr(std::string("RECORDER|").size());
 
 
-        auto it = DB_MAP.find(name);
-        if (it == DB_MAP.end()) continue;
+        int dbId = getDbIdFromName(name);
+        if (dbId < 0) continue;
 
         // Read state
         std::string redisKey = "RECORDER|" + name;
@@ -390,10 +413,10 @@ int main()
         std::lock_guard<std::mutex> lk(mtx);
         bool have = (recorders.find(name) != recorders.end());
         if (want_enabled && !have) {
-            auto rec = std::unique_ptr<DBRecorder>(new DBRecorder(it->second));
+            auto rec = std::unique_ptr<DBRecorder>(new DBRecorder(name));
             rec->start();
             recorders.emplace(name, std::move(rec));
-            SWSS_LOG_NOTICE("enabled recorder for %s (db %d)", name.c_str(), it->second);
+            SWSS_LOG_NOTICE("enabled recorder for %s (db %d)", name.c_str(), dbId);
         } else if (!want_enabled && have) {
             recorders[name]->stop();
             recorders.erase(name);
@@ -402,7 +425,7 @@ int main()
     }
 
     // Shutdown
-    try { cps->punsubscribe("__keyspace@4__:RECORDER*"); } catch (...) {}
+    try { cps->punsubscribe(configKeyspacePattern); } catch (...) {}
     {
         std::lock_guard<std::mutex> lk(mtx);
         for (auto &kv : recorders) {
