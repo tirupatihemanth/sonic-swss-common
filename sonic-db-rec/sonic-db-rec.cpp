@@ -31,6 +31,10 @@ using swss::SonicDBConfig;
 std::atomic<bool> g_stop{false};
 std::atomic<unsigned int> g_rotateGen{0};
 
+// Configuration constants
+const char* const RECORD_DIR = "/var/log/record";
+const char* const CONFIG_DB_JSON_PATH = "/etc/sonic/config_db.json";
+
 // Helper functions for database name or id
 int getDbIdFromName(const std::string& dbName) {
     try {
@@ -69,9 +73,8 @@ std::string ts()
 
 void ensureRecordDir()
 {
-    const char* dir = "/var/log/record";
     struct stat st;
-    if (stat(dir, &st) == 0)
+    if (stat(RECORD_DIR, &st) == 0)
     {
         if (S_ISDIR(st.st_mode))
         {
@@ -79,10 +82,17 @@ void ensureRecordDir()
         }
     }
 
-    if (mkdir(dir, 0755) != 0 && errno != EEXIST)
+    if (mkdir(RECORD_DIR, 0755) != 0 && errno != EEXIST)
     {
-        SWSS_LOG_WARN("failed to create %s: %s", dir, std::strerror(errno));
+        SWSS_LOG_WARN("failed to create %s: %s", RECORD_DIR, std::strerror(errno));
     }
+}
+
+std::string getLogFileName(const std::string& dbName)
+{
+    std::string lowercaseDbName = dbName;
+    std::transform(lowercaseDbName.begin(), lowercaseDbName.end(), lowercaseDbName.begin(), [](unsigned char uc){ return static_cast<char>(std::tolower(uc)); });
+    return std::string(RECORD_DIR) + "/" + lowercaseDbName + ".rec";
 }
 
 std::unique_ptr<DBConnector> makeDbConnectorWithRetry(const std::string& dbName, unsigned int timeout_ms)
@@ -115,8 +125,7 @@ DBRecorder::DBRecorder(const std::string& dbName)
     if (!m_conn) {
         throw std::runtime_error("DBRecorder constructed without Redis connection");
     }
-    const std::string path = "/var/log/record/" + dbName + ".rec";
-    m_logPath = path;
+    m_logPath = getLogFileName(dbName);
     m_log.open(m_logPath, std::ios::out | std::ios::app);
     if (!m_log.is_open()) {
         SWSS_LOG_WARN("Failed to open log file %s", m_logPath.c_str());
@@ -274,9 +283,9 @@ std::unordered_map<std::string, bool> read_initial_config()
 {
     std::unordered_map<std::string, bool> result;
     try {
-        std::ifstream f("/etc/sonic/config_db.json");
+        std::ifstream f(CONFIG_DB_JSON_PATH);
         if (!f.is_open()) {
-            SWSS_LOG_ERROR("Failed to open /etc/sonic/config_db.json");
+            SWSS_LOG_ERROR("Failed to open %s", CONFIG_DB_JSON_PATH);
             return result;
         }
         nlohmann::json j;
