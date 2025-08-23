@@ -18,6 +18,10 @@
 using swss::DBConnector;
 using swss::PubSub;
 
+// Configuration constants
+extern const char* const RECORD_DIR;
+extern const char* const CONFIG_DB_JSON_PATH;
+
 // Helper functions for database operations
 int getDbIdFromName(const std::string& dbName);
 std::string getDbSeparator(const std::string& dbName);
@@ -29,6 +33,7 @@ extern std::atomic<unsigned int> g_rotateGen;
 // Utility functions
 std::string ts();
 void ensureRecordDir();
+std::string getLogFileName(const std::string& dbName);
 std::unique_ptr<DBConnector> makeDbConnectorWithRetry(const std::string& dbName, unsigned int timeout_ms);
 std::unordered_map<std::string, bool> read_initial_config();
 
