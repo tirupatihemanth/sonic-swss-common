@@ -31,9 +31,13 @@ using swss::SonicDBConfig;
 std::atomic<bool> g_stop{false};
 std::atomic<unsigned int> g_rotateGen{0};
 
+// Global recorder management
+std::unordered_map<std::string, std::unique_ptr<DBRecorder>> g_recorders;
+std::mutex g_mtx;
+
 // Configuration constants
-const char* const RECORD_DIR = "/var/log/record";
-const char* const CONFIG_DB_JSON_PATH = "/etc/sonic/config_db.json";
+const char* RECORD_DIR = "/var/log/record";
+const char* CONFIG_DB_JSON_PATH = "/etc/sonic/config_db.json";
 
 // Helper functions for database name or id
 int getDbIdFromName(const std::string& dbName) {
@@ -317,42 +321,8 @@ std::unordered_map<std::string, bool> read_initial_config()
 void handle_signal(int) { g_stop = true; }
 void handle_sighup(int) { g_rotateGen.fetch_add(1, std::memory_order_relaxed); }
 
-int main()
+void initializeRecorders()
 {
-    if (std::signal(SIGINT, handle_signal) == SIG_ERR)
-    {
-        SWSS_LOG_ERROR("failed to setup SIGINT action");
-        exit(1);
-    }
-
-    if (std::signal(SIGTERM, handle_signal) == SIG_ERR)
-    {
-        SWSS_LOG_ERROR("failed to setup SIGTERM action");
-        exit(1);
-    }
-
-    if (std::signal(SIGHUP, handle_sighup) == SIG_ERR)
-    {
-        SWSS_LOG_ERROR("failed to setup SIGHUP action");
-        exit(1);
-    }
-
-    ensureRecordDir();
-
-    // Initialize SonicDBConfig to read database configuration
-    try {
-        SonicDBConfig::initialize();
-        SWSS_LOG_INFO("SonicDBConfig initialized successfully");
-    } catch (const std::exception& e) {
-        SWSS_LOG_ERROR("Failed to initialize SonicDBConfig: %s", e.what());
-        exit(1);
-    }
-
-    SWSS_LOG_INFO("Starting sonic-db-rec (C++14)");
-
-    std::unordered_map<std::string, std::unique_ptr<DBRecorder>> recorders;
-    std::mutex mtx;
-
     // Initial config
     auto init = read_initial_config();
     for (const auto& kv : init) {
@@ -360,16 +330,19 @@ int main()
         if (kv.second && dbId >= 0) {
             auto rec = std::unique_ptr<DBRecorder>(new DBRecorder(kv.first));
             rec->start();
-            recorders.emplace(kv.first, std::move(rec));
+            g_recorders.emplace(kv.first, std::move(rec));
             SWSS_LOG_NOTICE("started recorder for %s (db %d)", kv.first.c_str(), dbId);
         }
     }
+}
 
+void runControlLoop()
+{
     // Control loop on CONFIG_DB: "__keyspace@<config_db_id>__:RECORDER*"
     std::unique_ptr<DBConnector> conf = makeDbConnectorWithRetry("CONFIG_DB", 0);
     if (!conf) {
         SWSS_LOG_ERROR("Exiting: could not connect to CONFIG_DB");
-        return 1;
+        return;
     }
     int configDbId = getDbIdFromName("CONFIG_DB");
     std::string configKeyspacePattern = "__keyspace@" + std::to_string(configDbId) + "__:RECORDER*";
@@ -419,29 +392,69 @@ int main()
         bool want_enabled = (state == "enabled");
 
 
-        std::lock_guard<std::mutex> lk(mtx);
-        bool have = (recorders.find(name) != recorders.end());
+        std::lock_guard<std::mutex> lk(g_mtx);
+        bool have = (g_recorders.find(name) != g_recorders.end());
         if (want_enabled && !have) {
             auto rec = std::unique_ptr<DBRecorder>(new DBRecorder(name));
             rec->start();
-            recorders.emplace(name, std::move(rec));
+            g_recorders.emplace(name, std::move(rec));
             SWSS_LOG_NOTICE("enabled recorder for %s (db %d)", name.c_str(), dbId);
         } else if (!want_enabled && have) {
-            recorders[name]->stop();
-            recorders.erase(name);
+            g_recorders[name]->stop();
+            g_recorders.erase(name);
             SWSS_LOG_NOTICE("disabled recorder for %s", name.c_str());
         }
     }
 
-    // Shutdown
+    // Cleanup pubsub
     try { cps->punsubscribe(configKeyspacePattern); } catch (...) {}
-    {
-        std::lock_guard<std::mutex> lk(mtx);
-        for (auto &kv : recorders) {
-            kv.second->stop();
-        }
-        recorders.clear();
+}
+
+void shutdownRecorders()
+{
+    std::lock_guard<std::mutex> lk(g_mtx);
+    for (auto &kv : g_recorders) {
+        kv.second->stop();
     }
+    g_recorders.clear();
+}
+
+int main()
+{
+    if (std::signal(SIGINT, handle_signal) == SIG_ERR)
+    {
+        SWSS_LOG_ERROR("failed to setup SIGINT action");
+        exit(1);
+    }
+
+    if (std::signal(SIGTERM, handle_signal) == SIG_ERR)
+    {
+        SWSS_LOG_ERROR("failed to setup SIGTERM action");
+        exit(1);
+    }
+
+    if (std::signal(SIGHUP, handle_sighup) == SIG_ERR)
+    {
+        SWSS_LOG_ERROR("failed to setup SIGHUP action");
+        exit(1);
+    }
+
+    ensureRecordDir();
+
+    // Initialize SonicDBConfig to read database configuration
+    try {
+        SonicDBConfig::initialize();
+        SWSS_LOG_INFO("SonicDBConfig initialized successfully");
+    } catch (const std::exception& e) {
+        SWSS_LOG_ERROR("Failed to initialize SonicDBConfig: %s", e.what());
+        exit(1);
+    }
+
+    SWSS_LOG_INFO("Starting sonic-db-rec (C++14)");
+
+    initializeRecorders();
+    runControlLoop();
+    shutdownRecorders();
 
     SWSS_LOG_INFO("Exiting sonic-db-rec (C++14)");
     return 0;
