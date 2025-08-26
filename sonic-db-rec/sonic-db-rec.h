@@ -18,9 +18,11 @@
 using swss::DBConnector;
 using swss::PubSub;
 
+class DBRecorder;
+
 // Configuration constants
-extern const char* const RECORD_DIR;
-extern const char* const CONFIG_DB_JSON_PATH;
+extern const char* RECORD_DIR;
+extern const char* CONFIG_DB_JSON_PATH;
 
 // Helper functions for database operations
 int getDbIdFromName(const std::string& dbName);
@@ -30,12 +32,21 @@ std::string getDbSeparator(const std::string& dbName);
 extern std::atomic<bool> g_stop;
 extern std::atomic<unsigned int> g_rotateGen;
 
+// Global recorder management
+extern std::unordered_map<std::string, std::unique_ptr<DBRecorder>> g_recorders;
+extern std::mutex g_mtx;
+
 // Utility functions
 std::string ts();
 void ensureRecordDir();
 std::string getLogFileName(const std::string& dbName);
 std::unique_ptr<DBConnector> makeDbConnectorWithRetry(const std::string& dbName, unsigned int timeout_ms);
 std::unordered_map<std::string, bool> read_initial_config();
+
+// Main function components
+void initializeRecorders();
+void runControlLoop();
+void shutdownRecorders();
 
 class DBRecorder {
 public:
@@ -45,13 +56,11 @@ public:
     void start();
     void stop();
 
-    // Public interface for testing
     int getDbId() const { return m_dbId; }
     char getSeparator() const { return m_sep; }
     bool isRunning() const { return m_running.load(); }
     const std::string& getLogPath() const { return m_logPath; }
 
-    // Static utility methods for testing
     static std::string getOrEmpty(const std::map<std::string, std::string>& m, const char* k);
     static bool parseChannel(const std::string& ch, char sep, std::string& table, std::string& keys);
 
