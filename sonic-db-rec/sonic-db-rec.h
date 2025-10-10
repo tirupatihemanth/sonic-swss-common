@@ -41,6 +41,7 @@ std::string ts();
 void ensureRecordDir();
 std::string getLogFileName(const std::string& dbName);
 std::unique_ptr<DBConnector> makeDbConnectorWithRetry(const std::string& dbName, unsigned int timeout_ms);
+bool waitForPath(const std::string& path, unsigned int timeoutSeconds, bool isDirectory);
 std::unordered_map<std::string, bool> read_initial_config();
 
 // Main function components

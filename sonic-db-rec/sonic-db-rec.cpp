@@ -12,6 +12,8 @@
 #include <algorithm>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/inotify.h>
+#include <unistd.h>
 #include <errno.h>
 #include <cstring>
 
@@ -38,6 +40,8 @@ std::mutex g_mtx;
 // Configuration constants
 const char* RECORD_DIR = "/var/log/record";
 const char* CONFIG_DB_JSON_PATH = "/etc/sonic/config_db.json";
+const char* DATABASE_CONFIG_JSON_PATH = "/var/run/redis/sonic-db/database_config.json";
+const unsigned int DATABASE_CONFIG_JSON_TIMEOUT = 600; // Seconds to wait for database_config.json to become available at boot
 
 // Helper functions for database name or id
 int getDbIdFromName(const std::string& dbName) {
@@ -283,6 +287,131 @@ void DBRecorder::write_line(const std::string& tableKey, const char* tag, const 
     }
 }
 
+bool waitForPath(const std::string& path, unsigned int timeoutSeconds, bool isDirectory)
+{
+    // First check if path already exists
+    struct stat st;
+    if (stat(path.c_str(), &st) == 0) {
+        if (isDirectory) {
+            return S_ISDIR(st.st_mode);
+        }
+        // For files, ensure they have content (not empty/being written)
+        if (st.st_size > 0) {
+            return true;  // File exists and has content
+        }
+        // File exists but is empty, fall through to wait for content
+        SWSS_LOG_INFO("File %s exists but is empty, waiting for content...", path.c_str());
+    }
+
+    // Extract parent directory and name
+    std::string parentDir;
+    std::string name;
+    size_t pos = path.find_last_of('/');
+    if (pos != std::string::npos) {
+        if (pos > 0) {
+            parentDir = path.substr(0, pos);
+            name = path.substr(pos + 1);
+        } else {
+            parentDir = "/";
+            name = path.substr(pos + 1);
+        }
+    } else {
+        parentDir = ".";
+        name = path;
+    }
+
+    // Recursively wait for parent directory if it doesn't exist
+    if (stat(parentDir.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) {
+        SWSS_LOG_INFO("Parent directory %s does not exist, waiting for it first...", parentDir.c_str());
+        if (!waitForPath(parentDir, timeoutSeconds, true)) {
+            SWSS_LOG_ERROR("Parent directory %s did not become available", parentDir.c_str());
+            return false;
+        }
+    }
+
+    int inotifyFd = inotify_init();
+    if (inotifyFd < 0) {
+        SWSS_LOG_ERROR("inotify_init failed: %s", std::strerror(errno));
+        return false;
+    }
+
+    // For directories, watch CREATE and MOVED_TO
+    // For files, only watch CLOSE_WRITE (guarantees file is fully written)
+    uint32_t mask = isDirectory ? (IN_CREATE | IN_MOVED_TO) : IN_CLOSE_WRITE;
+    int watchFd = inotify_add_watch(inotifyFd, parentDir.c_str(), mask);
+    if (watchFd < 0) {
+        SWSS_LOG_ERROR("inotify_add_watch failed for %s: %s", parentDir.c_str(), std::strerror(errno));
+        close(inotifyFd);
+        return false;
+    }
+
+    bool found = false;
+    auto startTime = std::chrono::steady_clock::now();
+    const auto timeout = std::chrono::seconds(timeoutSeconds);
+
+    while (!found && !g_stop.load()) {
+        auto elapsed = std::chrono::steady_clock::now() - startTime;
+        if (elapsed >= timeout) {
+            SWSS_LOG_WARN("Timeout waiting for %s %s after %u seconds", 
+                         isDirectory ? "directory" : "file", path.c_str(), timeoutSeconds);
+            break;
+        }
+
+        fd_set readfds;
+        FD_ZERO(&readfds);
+        FD_SET(inotifyFd, &readfds);
+        
+        struct timeval tv;
+        tv.tv_sec = 1;
+        tv.tv_usec = 0;
+
+        int ret = select(inotifyFd + 1, &readfds, nullptr, nullptr, &tv);
+        if (ret < 0) {
+            if (errno == EINTR) continue;
+            SWSS_LOG_ERROR("select failed: %s", std::strerror(errno));
+            break;
+        }
+
+        if (ret == 0) continue;
+
+        if (FD_ISSET(inotifyFd, &readfds)) {
+            char buffer[4096] __attribute__ ((aligned(__alignof__(struct inotify_event))));
+            ssize_t len = read(inotifyFd, buffer, sizeof(buffer));
+            if (len < 0) {
+                SWSS_LOG_ERROR("read from inotify failed: %s", std::strerror(errno));
+                break;
+            }
+
+            const struct inotify_event* event;
+            for (char* ptr = buffer; ptr < buffer + len; ptr += sizeof(struct inotify_event) + event->len) {
+                event = reinterpret_cast<const struct inotify_event*>(ptr);
+                if (event->len > 0 && name == event->name) {
+                    // Verify the path exists
+                    if (stat(path.c_str(), &st) == 0) {
+                        if (isDirectory && !S_ISDIR(st.st_mode)) {
+                            continue;  // Not a directory, keep waiting
+                        }
+                        if (!isDirectory && st.st_size == 0) {
+                            SWSS_LOG_WARN("File %s closed but is empty", path.c_str());
+                            continue;  // Empty file, keep waiting
+                        }
+                        found = true;
+                        SWSS_LOG_INFO("%s %s is now available%s", 
+                                     isDirectory ? "Directory" : "File", 
+                                     path.c_str(),
+                                     isDirectory ? "" : " (fully written)");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    inotify_rm_watch(inotifyFd, watchFd);
+    close(inotifyFd);
+    return found;
+}
+
 std::unordered_map<std::string, bool> read_initial_config()
 {
     std::unordered_map<std::string, bool> result;
@@ -440,6 +569,14 @@ int main()
     }
 
     ensureRecordDir();
+
+    // Ensure database_config.json exists before initializing SonicDBConfig
+    // This will automatically wait for parent directories if they don't exist
+    if (!waitForPath(DATABASE_CONFIG_JSON_PATH, DATABASE_CONFIG_JSON_TIMEOUT, false))
+    {
+        SWSS_LOG_ERROR("Database config file %s did not become available within timeout", DATABASE_CONFIG_JSON_PATH);
+        exit(1);
+    }
 
     // Initialize SonicDBConfig to read database configuration
     try {
