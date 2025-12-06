@@ -455,12 +455,17 @@ void initializeRecorders()
     // Initial config
     auto init = read_initial_config();
     for (const auto& kv : init) {
-        int dbId = getDbIdFromName(kv.first);
+        // Normalize database name to uppercase for consistent lookup
+        std::string dbName = kv.first;
+        std::transform(dbName.begin(), dbName.end(), dbName.begin(),
+                      [](unsigned char c){ return static_cast<char>(std::toupper(c)); });
+
+        int dbId = getDbIdFromName(dbName);
         if (kv.second && dbId >= 0) {
-            auto rec = std::unique_ptr<DBRecorder>(new DBRecorder(kv.first));
+            auto rec = std::unique_ptr<DBRecorder>(new DBRecorder(dbName));
             rec->start();
-            g_recorders.emplace(kv.first, std::move(rec));
-            SWSS_LOG_NOTICE("started recorder for %s (db %d)", kv.first.c_str(), dbId);
+            g_recorders.emplace(dbName, std::move(rec));
+            SWSS_LOG_NOTICE("started recorder for %s (db %d)", dbName.c_str(), dbId);
         }
     }
 }
@@ -498,13 +503,16 @@ void runControlLoop()
 
         if (op != "hset" && op != "hdel" && op != "del") continue;
 
-        // ch like "__keyspace@4__:RECORDER|config_db"
+        // ch like "__keyspace@4__:RECORDER|CONFIG_DB"
         auto pos = ch.find(':');
         if (pos == std::string::npos) continue;
         std::string key = ch.substr(pos + 1);
         if (key.find("RECORDER|") != 0) continue;
         std::string name = key.substr(std::string("RECORDER|").size());
 
+        // Normalize to uppercase for consistent lookup
+        std::transform(name.begin(), name.end(), name.begin(), 
+                      [](unsigned char c){ return static_cast<char>(std::toupper(c)); });
 
         int dbId = getDbIdFromName(name);
         if (dbId < 0) continue;
