@@ -36,3 +36,9 @@ Architecture: any
 Depends: ${shlibs:Depends}, ${misc:Pre-Depends}
 Section: libs
 Description: This package contains SONiC DB cli.
+
+Package: sonic-db-rec
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Pre-Depends}
+Section: libs
+Description: This package contains SONiC DB recorder.
